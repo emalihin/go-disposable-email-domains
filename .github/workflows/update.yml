@@ -1,0 +1,95 @@
+name: Update blocklist
+
+on:
+  schedule:
+    - cron: "17 3 * * *" # daily, 03:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-blocklist
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # need tags to compute the next version
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Fetch upstream list
+        run: ./scripts/update.sh
+
+      - name: Check for changes
+        id: diff
+        run: |
+          if git diff --quiet -- disposable_email_blocklist.conf; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No upstream changes."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            added=$(git diff -U0 -- disposable_email_blocklist.conf | grep -c '^+[^+]' || true)
+            removed=$(git diff -U0 -- disposable_email_blocklist.conf | grep -c '^-[^-]' || true)
+            echo "added=$added" >> "$GITHUB_OUTPUT"
+            echo "removed=$removed" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Test
+        if: steps.diff.outputs.changed == 'true'
+        run: go test ./...
+
+      - name: Compute next version
+        if: steps.diff.outputs.changed == 'true'
+        id: version
+        run: |
+          latest=$(git tag --list 'v*' --sort=-v:refname | head -n1)
+          if [ -z "$latest" ]; then
+            next="v0.1.0"
+          else
+            IFS=. read -r major minor patch <<< "${latest#v}"
+            next="v${major}.${minor}.$((patch + 1))"
+          fi
+          echo "tag=$next" >> "$GITHUB_OUTPUT"
+
+      - name: Commit, tag and push
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          ADDED: ${{ steps.diff.outputs.added }}
+          REMOVED: ${{ steps.diff.outputs.removed }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add disposable_email_blocklist.conf
+          git commit -m "Update blocklist (+${ADDED} -${REMOVED})"
+          git tag -a "$TAG" -m "Blocklist update (+${ADDED} -${REMOVED})"
+          git push origin HEAD:main
+          git push origin "$TAG"
+
+      - name: Create GitHub release
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          ADDED: ${{ steps.diff.outputs.added }}
+          REMOVED: ${{ steps.diff.outputs.removed }}
+        run: |
+          gh release create "$TAG" --title "$TAG" \
+            --notes "Upstream blocklist sync: ${ADDED} domains added, ${REMOVED} removed."
+
+      - name: Publish to Go module proxy
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          # Requesting the version makes proxy.golang.org (and pkg.go.dev) index it.
+          # Run outside the repo so Go doesn't treat it as the main module.
+          cd "$(mktemp -d)"
+          GOPROXY=https://proxy.golang.org go list -m "github.com/${GITHUB_REPOSITORY}@${TAG}"
